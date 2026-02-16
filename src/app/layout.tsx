@@ -22,7 +22,7 @@ const crimsonText = Crimson_Text({
 
 export const metadata: Metadata = {
   title: "The Vault of Azeroth",
-  description: "Tracking the CLO Hoard across the Sei Realm",
+  description: "Tracking contracts across the Sei Realm",
 };
 
 export default function RootLayout({
