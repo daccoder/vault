@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getPublicClient } from "@/lib/chain";
-import { decodeAbiParameters, keccak256, toBytes, type Address } from "viem";
+import { getPublicClient, fetchAbiFromExplorer } from "@/lib/chain";
+import { decodeAbiParameters, keccak256, toBytes, isAddress, type Address } from "viem";
 
 // Claimed event topic variants
 const CLAIMED_TOPICS = [
@@ -10,6 +10,8 @@ const CLAIMED_TOPICS = [
   keccak256(toBytes("Claimed(address,uint256)")),
   // TokensClaimed(address indexed claimant, uint256 amount)
   keccak256(toBytes("TokensClaimed(address,uint256)")),
+  // TokenClaimed(address indexed account, uint256 amount)
+  keccak256(toBytes("TokenClaimed(address,uint256)")),
 ];
 
 // How to decode the data field for each topic variant
@@ -31,6 +33,11 @@ const DECODERS: Record<string, { params: readonly { name: string; type: string }
   },
   [CLAIMED_TOPICS[2]]: {
     // claimant is indexed (in topics[1]), amount is in data
+    params: [{ name: "amount", type: "uint256" }],
+    amountIndex: 0,
+  },
+  [CLAIMED_TOPICS[3]]: {
+    // account is indexed (in topics[1]), amount is in data
     params: [{ name: "amount", type: "uint256" }],
     amountIndex: 0,
   },
@@ -67,15 +74,17 @@ const ERC20_ABI = [
   },
 ] as const;
 
-const TOKEN_GETTER_ABI = [
+const TOKEN_GETTER_NAMES = ["token", "rewardToken", "claimToken", "distributionToken", "clovis"] as const;
+
+const TOKEN_GETTER_ABIS = TOKEN_GETTER_NAMES.map((name) => [
   {
     type: "function" as const,
-    name: "token",
+    name,
     stateMutability: "view" as const,
     inputs: [],
     outputs: [{ name: "", type: "address" }],
   },
-] as const;
+] as const);
 
 interface EtherscanLog {
   data: string;
@@ -138,32 +147,48 @@ async function fetchLogsViaEtherscan(
 }
 
 /**
- * Fallback: use viem getLogs for chains without Etherscan (Sei).
+ * Fetch logs via SeiTrace's Etherscan-compatible API (for Sei chain).
+ * Uses the same pagination approach as fetchLogsViaEtherscan but with SeiTrace endpoint.
  */
-async function fetchLogsViaRpc(
-  chainId: number,
-  address: Address,
-  topic0: `0x${string}`,
+async function fetchLogsViaSeiTrace(
+  address: string,
+  topic0: string,
 ): Promise<EtherscanLog[] | null> {
-  const client = getPublicClient(chainId);
-  try {
-    const filter = await client.createEventFilter({
-      address,
-      fromBlock: 0n,
-      toBlock: "latest",
-    });
-    const logs = await client.getFilterLogs({ filter });
-    const matched = logs.filter((l) => l.topics[0] === topic0);
-    return matched.length > 0
-      ? matched.map((l) => ({
-          data: l.data,
-          topics: l.topics as string[],
-          blockNumber: "0x" + l.blockNumber.toString(16),
-        }))
-      : null;
-  } catch {
-    return null;
+  const allLogs: EtherscanLog[] = [];
+  let fromBlock = 0;
+  let retries = 0;
+
+  for (let page = 0; page < 500; page++) {
+    if (page > 0) await sleep(350);
+
+    const url = `https://seitrace.com/pacific-1/api?module=logs&action=getLogs&address=${address}&fromBlock=${fromBlock}&toBlock=latest&topic0=${topic0}`;
+    const res = await fetch(url);
+    const json = await res.json();
+
+    if (json.status === "0" && typeof json.result === "string" && json.result.includes("rate limit")) {
+      if (retries < 3) {
+        retries++;
+        await sleep(1500);
+        page--;
+        continue;
+      }
+      break;
+    }
+    retries = 0;
+
+    if (json.status !== "1" || !Array.isArray(json.result) || json.result.length === 0) {
+      break;
+    }
+
+    allLogs.push(...json.result);
+
+    if (json.result.length < 1000) break;
+
+    const lastBlock = parseInt(json.result[json.result.length - 1].blockNumber, 16);
+    fromBlock = lastBlock + 1;
   }
+
+  return allLogs.length > 0 ? allLogs : null;
 }
 
 export async function POST(req: NextRequest) {
@@ -179,17 +204,68 @@ export async function POST(req: NextRequest) {
     const client = getPublicClient(chainId);
     const contractAddr = address as Address;
     const usesEtherscan = chainId !== 1329 && !!process.env.ETHERSCAN_API_KEY;
+    const usesSeiTrace = chainId === 1329;
 
     // 1. Try to get the token address from the distributor
     let tokenAddress: Address | null = null;
-    try {
-      tokenAddress = await client.readContract({
-        address: contractAddr,
-        abi: TOKEN_GETTER_ABI,
-        functionName: "token",
-      });
-    } catch {
-      // Contract may not have a token() getter
+
+    // First try common getter names
+    for (let i = 0; i < TOKEN_GETTER_NAMES.length; i++) {
+      try {
+        tokenAddress = await client.readContract({
+          address: contractAddr,
+          abi: TOKEN_GETTER_ABIS[i],
+          functionName: TOKEN_GETTER_NAMES[i],
+        });
+        if (tokenAddress) break;
+      } catch {
+        // Try next getter name
+      }
+    }
+
+    // If none matched, fetch the ABI and try all no-input address-returning functions
+    if (!tokenAddress) {
+      try {
+        const abiFns = await fetchAbiFromExplorer(address, chainId);
+        const addrFns = abiFns.filter(
+          (fn) =>
+            fn.inputs.length === 0 &&
+            fn.outputs.length === 1 &&
+            fn.outputs[0].type === "address" &&
+            !["owner", "pendingOwner", "admin", "implementation"].includes(fn.name),
+        );
+        for (const fn of addrFns) {
+          try {
+            const result = await client.readContract({
+              address: contractAddr,
+              abi: [fn],
+              functionName: fn.name,
+            });
+            // Verify it's a valid address with ERC20 code
+            if (result && isAddress(result as string)) {
+              const code = await client.getCode({ address: result as Address });
+              if (code && code !== "0x") {
+                // Quick check: does it have decimals()? (ERC20 indicator)
+                try {
+                  await client.readContract({
+                    address: result as Address,
+                    abi: ERC20_ABI,
+                    functionName: "decimals",
+                  });
+                  tokenAddress = result as Address;
+                  break;
+                } catch {
+                  // Not an ERC20, skip
+                }
+              }
+            }
+          } catch {
+            // Skip failed calls
+          }
+        }
+      } catch {
+        // ABI fetch failed, continue without token info
+      }
     }
 
     // 2. Scan for Claimed events — try each topic signature
@@ -202,7 +278,9 @@ export async function POST(req: NextRequest) {
 
       const logs = usesEtherscan
         ? await fetchLogsViaEtherscan(chainId, address, topic0)
-        : await fetchLogsViaRpc(chainId, contractAddr, topic0 as `0x${string}`);
+        : usesSeiTrace
+          ? await fetchLogsViaSeiTrace(address, topic0)
+          : null;
 
       if (logs && logs.length > 0) {
         matchedTopic = topic0;

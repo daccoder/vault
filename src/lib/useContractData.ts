@@ -22,11 +22,13 @@ const CLAIM_FN_PATTERNS = [
 ];
 
 // Heuristic: if the ABI has these functions, it's likely a Merkle distributor
-const MERKLE_SIGNATURES = ["isclaimed", "merkleroot", "claim"];
+const MERKLE_SIGNATURES = ["isclaimed", "merkleroot", "claim", "claimedamounts", "claimed"];
 
 function looksLikeMerkleDistributor(fns: AbiFunction[]): boolean {
   const names = new Set(fns.map((f) => f.name.toLowerCase()));
-  return MERKLE_SIGNATURES.filter((s) => names.has(s)).length >= 2;
+  // Must have merkleRoot + at least one claim-related function
+  if (!names.has("merkleroot")) return false;
+  return MERKLE_SIGNATURES.filter((s) => s !== "merkleroot" && names.has(s)).length >= 1;
 }
 
 const EMPTY_TOKEN_INFO: TokenInfo = {
@@ -124,8 +126,11 @@ export function useContractData(contractAddress: string, chainId: number) {
         if (cancelled) return;
         setAbiFunctions(fns);
 
-        // Auto-call all no-input functions in parallel
-        const noInputFns = fns.filter((fn) => fn.inputs.length === 0);
+        // Auto-call all no-input functions in parallel (skip known proxy functions that revert)
+        const SKIP_AUTO_READ = new Set(["proxiableuuid", "upgrade_interface_version"]);
+        const noInputFns = fns.filter(
+          (fn) => fn.inputs.length === 0 && !SKIP_AUTO_READ.has(fn.name.toLowerCase()),
+        );
         const autoResults: Record<string, unknown> = {};
 
         const settled = await Promise.allSettled(

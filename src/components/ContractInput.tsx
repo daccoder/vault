@@ -11,7 +11,12 @@ interface ContractInputProps {
   onChainChange: (chainId: number) => void;
 }
 
-export default function ContractInput({ defaultAddress, chainId, onSubmit, onChainChange }: ContractInputProps) {
+export default function ContractInput({
+  defaultAddress,
+  chainId,
+  onSubmit,
+  onChainChange,
+}: ContractInputProps) {
   const [contractAddress, setContractAddress] = useState(defaultAddress);
 
   const handleSubmit = () => {
@@ -41,7 +46,7 @@ export default function ContractInput({ defaultAddress, chainId, onSubmit, onCha
       </select>
 
       <label className="text-[10px] text-gray-500 block mb-1 uppercase tracking-wider">
-        Paste a verified contract address
+        Paste an airdrop distributor address contract address
       </label>
       <input
         type="text"
