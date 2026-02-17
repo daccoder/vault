@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import type { AbiFunction } from "viem";
-import { fetchAbi, readContract } from "@/lib/client";
+import { fetchAbi, readContract, fetchMerkleStats } from "@/lib/client";
 import type { TokenInfo } from "@/lib/types";
 
 export interface FunctionResult {
@@ -21,23 +21,39 @@ const CLAIM_FN_PATTERNS = [
   "totalvested",
 ];
 
-export function useContractData(contractAddress: string) {
+// Heuristic: if the ABI has these functions, it's likely a Merkle distributor
+const MERKLE_SIGNATURES = ["isclaimed", "merkleroot", "claim"];
+
+function looksLikeMerkleDistributor(fns: AbiFunction[]): boolean {
+  const names = new Set(fns.map((f) => f.name.toLowerCase()));
+  return MERKLE_SIGNATURES.filter((s) => names.has(s)).length >= 2;
+}
+
+const EMPTY_TOKEN_INFO: TokenInfo = {
+  name: null,
+  symbol: null,
+  decimals: null,
+  totalSupply: null,
+  totalClaimed: null,
+  claimedPercent: null,
+  claimCount: null,
+  source: null,
+};
+
+export function useContractData(contractAddress: string, chainId: number) {
   const [abiFunctions, setAbiFunctions] = useState<AbiFunction[]>([]);
   const [results, setResults] = useState<Record<string, FunctionResult>>({});
   const [inputValues, setInputValues] = useState<Record<string, Record<string, string>>>({});
   const [loading, setLoading] = useState(false);
+  const [scanningEvents, setScanningEvents] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [tokenInfo, setTokenInfo] = useState<TokenInfo>({
-    name: null,
-    symbol: null,
-    decimals: null,
-    totalSupply: null,
-    totalClaimed: null,
-    claimedPercent: null,
-  });
+  const [tokenInfo, setTokenInfo] = useState<TokenInfo>(EMPTY_TOKEN_INFO);
 
   const addressRef = useRef(contractAddress);
   addressRef.current = contractAddress;
+
+  const chainIdRef = useRef(chainId);
+  chainIdRef.current = chainId;
 
   const callFunction = useCallback(
     async (fn: AbiFunction, args: Record<string, string>) => {
@@ -60,6 +76,7 @@ export function useContractData(contractAddress: string) {
           addressRef.current,
           fn,
           fnArgs.length > 0 ? fnArgs : undefined,
+          chainIdRef.current,
         );
 
         setResults((prev) => ({
@@ -80,16 +97,14 @@ export function useContractData(contractAddress: string) {
     [],
   );
 
-  // Fetch ABI and auto-read on address change
+  // Fetch ABI and auto-read on address or chain change
   useEffect(() => {
     if (!contractAddress) {
       setAbiFunctions([]);
       setResults({});
       setError(null);
-      setTokenInfo({
-        name: null, symbol: null, decimals: null,
-        totalSupply: null, totalClaimed: null, claimedPercent: null,
-      });
+      setTokenInfo(EMPTY_TOKEN_INFO);
+      setScanningEvents(false);
       return;
     }
 
@@ -97,13 +112,15 @@ export function useContractData(contractAddress: string) {
 
     async function load() {
       setLoading(true);
+      setScanningEvents(false);
       setError(null);
       setAbiFunctions([]);
       setResults({});
       setInputValues({});
+      setTokenInfo(EMPTY_TOKEN_INFO);
 
       try {
-        const fns = await fetchAbi(contractAddress);
+        const fns = await fetchAbi(contractAddress, chainId);
         if (cancelled) return;
         setAbiFunctions(fns);
 
@@ -113,9 +130,8 @@ export function useContractData(contractAddress: string) {
 
         const settled = await Promise.allSettled(
           noInputFns.map(async (fn) => {
-            const result = await readContract(contractAddress, fn);
+            const result = await readContract(contractAddress, fn, undefined, chainId);
             autoResults[fn.name] = result;
-            // Update individual result as it comes in
             if (!cancelled) {
               setResults((prev) => ({
                 ...prev,
@@ -144,21 +160,16 @@ export function useContractData(contractAddress: string) {
         if (cancelled) return;
 
         // Build token info from auto-read results
-        const info: TokenInfo = {
-          name: null, symbol: null, decimals: null,
-          totalSupply: null, totalClaimed: null, claimedPercent: null,
-        };
+        const info: TokenInfo = { ...EMPTY_TOKEN_INFO };
 
         if (typeof autoResults.name === "string") info.name = autoResults.name;
         if (typeof autoResults.symbol === "string") info.symbol = autoResults.symbol;
 
-        // decimals comes back as string from our API (was bigint)
         const rawDecimals = autoResults.decimals;
         if (rawDecimals !== undefined && rawDecimals !== null) {
           info.decimals = Number(rawDecimals);
         }
 
-        // totalSupply comes back as string from our API (was bigint)
         const rawSupply = autoResults.totalSupply;
         if (rawSupply !== undefined && rawSupply !== null) {
           try {
@@ -168,7 +179,7 @@ export function useContractData(contractAddress: string) {
           }
         }
 
-        // Find claimed amount from any matching function
+        // Find claimed amount from any matching view function
         for (const pattern of CLAIM_FN_PATTERNS) {
           const fnName = noInputFns.find(
             (f) => f.name.toLowerCase() === pattern,
@@ -176,6 +187,7 @@ export function useContractData(contractAddress: string) {
           if (fnName && autoResults[fnName] !== undefined && autoResults[fnName] !== null) {
             try {
               info.totalClaimed = BigInt(autoResults[fnName] as string);
+              info.source = "view";
               break;
             } catch {
               // not a bigint string
@@ -183,24 +195,52 @@ export function useContractData(contractAddress: string) {
           }
         }
 
-        // Compute claimed percent
+        // Compute claimed percent from view functions
         if (info.totalSupply && info.totalSupply > 0n && info.totalClaimed !== null) {
           info.claimedPercent =
             Number((info.totalClaimed * 10000n) / info.totalSupply) / 100;
         }
 
         setTokenInfo(info);
+
+        // Main loading done — contract reader is usable now
+        setLoading(false);
+
+        // --- Merkle fallback (runs in background) ---
+        if (info.claimedPercent === null && looksLikeMerkleDistributor(fns)) {
+          if (cancelled) return;
+          setScanningEvents(true);
+          try {
+            const stats = await fetchMerkleStats(contractAddress, chainId);
+            if (cancelled) return;
+
+            setTokenInfo((prev) => ({
+              ...prev,
+              name: stats.tokenName ?? prev.name,
+              symbol: stats.tokenSymbol ?? prev.symbol,
+              decimals: stats.decimals ?? prev.decimals,
+              totalSupply: BigInt(stats.totalAllocation),
+              totalClaimed: BigInt(stats.totalClaimed),
+              claimedPercent: stats.claimedPercent,
+              claimCount: stats.claimCount,
+              source: "events",
+            }));
+          } catch {
+            // Event scanning failed — no claim data available
+          } finally {
+            if (!cancelled) setScanningEvents(false);
+          }
+        }
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : "Failed to fetch ABI");
-      } finally {
-        if (!cancelled) setLoading(false);
+        setLoading(false);
       }
     }
 
     load();
     return () => { cancelled = true; };
-  }, [contractAddress, callFunction]);
+  }, [contractAddress, chainId, callFunction]);
 
   const handleInputChange = (fnName: string, inputName: string, value: string) => {
     setInputValues((prev) => ({
@@ -214,6 +254,7 @@ export function useContractData(contractAddress: string) {
     results,
     inputValues,
     loading,
+    scanningEvents,
     error,
     tokenInfo,
     callFunction,

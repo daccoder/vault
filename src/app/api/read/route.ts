@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { publicClient } from "@/lib/chain";
+import { getPublicClient, SUPPORTED_CHAINS } from "@/lib/chain";
 import type { AbiFunction } from "viem";
 
 function serializeValue(val: unknown): unknown {
@@ -18,17 +18,30 @@ function serializeValue(val: unknown): unknown {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { address, abiFunction, args } = body as {
+    const { address, abiFunction, args, chain } = body as {
       address: string;
       abiFunction: AbiFunction;
       args?: unknown[];
+      chain?: number;
     };
 
     if (!address || !abiFunction) {
       return NextResponse.json({ error: "Missing address or abiFunction" }, { status: 400 });
     }
 
-    const result = await publicClient.readContract({
+    const chainId = chain || 1329;
+    const client = getPublicClient(chainId);
+
+    const code = await client.getCode({ address: address as `0x${string}` });
+    if (!code || code === "0x") {
+      const chainName = SUPPORTED_CHAINS[chainId]?.name ?? "Unknown";
+      return NextResponse.json(
+        { error: `No contract found at this address on ${chainName}` },
+        { status: 404 },
+      );
+    }
+
+    const result = await client.readContract({
       address: address as `0x${string}`,
       abi: [abiFunction],
       functionName: abiFunction.name,
@@ -38,7 +51,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ result: serializeValue(result) });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Call failed";
-    // Extract just the useful part of viem's verbose errors
     const short = message.split("\n")[0].replace(/\s+/g, " ").slice(0, 200);
     return NextResponse.json({ error: short }, { status: 400 });
   }

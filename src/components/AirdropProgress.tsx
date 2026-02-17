@@ -6,6 +6,7 @@ import type { TokenInfo } from "@/lib/types";
 interface AirdropProgressProps {
   tokenInfo: TokenInfo;
   loading: boolean;
+  scanningEvents: boolean;
   hasContract: boolean;
 }
 
@@ -22,12 +23,14 @@ function formatBigInt(val: bigint | null, decimals: number | null): string {
 export default function AirdropProgress({
   tokenInfo,
   loading,
+  scanningEvents,
   hasContract,
 }: AirdropProgressProps) {
-  const { name, symbol, totalSupply, totalClaimed, claimedPercent, decimals } =
+  const { name, symbol, totalSupply, totalClaimed, claimedPercent, decimals, claimCount, source } =
     tokenInfo;
   const displayPercent = claimedPercent !== null ? Math.round(claimedPercent * 100) / 100 : null;
   const tokenLabel = symbol ?? name ?? "Token";
+  const supplyLabel = source === "events" ? "Total Allocation" : "Total Supply";
 
   return (
     <div className="stone-bg gold-border p-6 rounded-2xl">
@@ -71,7 +74,7 @@ export default function AirdropProgress({
           <div className="grid grid-cols-2 gap-3 text-center">
             <div className="bg-black/40 p-3 rounded-xl border border-gray-800/60">
               <p className="text-[10px] text-gray-500 uppercase tracking-wider">
-                Total Supply
+                {supplyLabel}
               </p>
               <p className="text-lg text-amber-400 font-bold">
                 {formatBigInt(totalSupply, decimals)}{" "}
@@ -110,7 +113,32 @@ export default function AirdropProgress({
                 <p className="text-lg text-parchment">{symbol}</p>
               </div>
             )}
+
+            {claimCount !== null && (
+              <div className="bg-black/40 p-3 rounded-xl border border-gray-800/60">
+                <p className="text-[10px] text-gray-500 uppercase tracking-wider">
+                  Claim Txns
+                </p>
+                <p className="text-lg text-amber-400 font-bold">
+                  {claimCount.toLocaleString()}
+                </p>
+              </div>
+            )}
           </div>
+
+          {scanningEvents && (
+            <p className="text-amber-400/70 text-xs animate-pulse text-center mt-4">
+              Scanning on-chain claim events...
+            </p>
+          )}
+
+          {source && !scanningEvents && (
+            <p className="text-[10px] text-gray-600 mt-3 text-center tracking-wide">
+              {source === "events"
+                ? "Claim data from on-chain event logs"
+                : "Claim data from contract view functions"}
+            </p>
+          )}
         </>
       )}
     </div>

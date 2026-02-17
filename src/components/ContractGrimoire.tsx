@@ -11,12 +11,13 @@ interface ContractGrimoireProps {
   loading: boolean;
   error: string | null;
   hasContract: boolean;
+  chainName: string;
   onCallFunction: (fn: AbiFunction, args: Record<string, string>) => void;
   onInputChange: (fnName: string, inputName: string, value: string) => void;
 }
 
 function formatResult(val: unknown): string {
-  if (val === null || val === undefined) return "—";
+  if (val === null || val === undefined) return "\u2014";
   if (typeof val === "bigint") return val.toLocaleString();
   if (typeof val === "boolean") return val ? "true" : "false";
   if (Array.isArray(val)) return val.map(formatResult).join(", ");
@@ -30,6 +31,7 @@ export default function ContractGrimoire({
   loading,
   error,
   hasContract,
+  chainName,
   onCallFunction,
   onInputChange,
 }: ContractGrimoireProps) {
@@ -142,7 +144,7 @@ export default function ContractGrimoire({
 
       <div className="mt-8 p-4 border-t border-amber-900/30 text-center">
         <p className="text-[10px] text-gray-600 tracking-wide">
-          Live reads from Sei EVM via SeiTrace
+          Live reads from {chainName}
         </p>
       </div>
     </div>
